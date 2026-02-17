@@ -1,19 +1,12 @@
-// till now my understanding we will use channel to send data from geyser plugin to worker
-// and then worker will send data to clickhouse
-
 use std::sync::Arc;
 use tokio::{
     sync::mpsc::Receiver,
     time::{Duration, sleep, timeout}
 };
 use log::{error, info};
-use chrono::{DateTime, Utc};
+use thiserror::Error;
 
-use crate::clickhouse_client::ClickhouseConnection;
-
-const BATCH_SIZE: usize = 1000;
-const BATCH_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RETRIES: u32 = 3;
+use crate::clickhouse_client::{AccountRow, ClickhouseConnection};
 
 #[derive(Debug)]
 pub struct AccountUpdate {
@@ -24,7 +17,7 @@ pub struct AccountUpdate {
     pub executable: u8,
     pub rent_epoch: u64,
     pub data: String,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at_unix_ms: i64,
     pub txn_signature: Option<String>,
     pub write_version: u64,
 }
@@ -32,21 +25,36 @@ pub struct AccountUpdate {
 pub struct Worker {
     conn: Arc<ClickhouseConnection>,
     receiver: Receiver<AccountUpdate>,
+    batch_size: usize,
+    batch_timeout: Duration,
+    max_retries: u32,
 }
 
 impl Worker {
-    pub fn new(conn: Arc<ClickhouseConnection>, receiver: Receiver<AccountUpdate>) -> Self {
-        Self { conn, receiver }
+    pub fn new(
+        conn: Arc<ClickhouseConnection>,
+        receiver: Receiver<AccountUpdate>,
+        batch_size: usize,
+        batch_timeout: Duration,
+        max_retries: u32,
+    ) -> Self {
+        Self {
+            conn,
+            receiver,
+            batch_size,
+            batch_timeout,
+            max_retries,
+        }
     }
 
     pub async fn run(&mut self) {
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batch = Vec::with_capacity(self.batch_size);
 
         loop {
-            match timeout(BATCH_TIMEOUT, self.receiver.recv()).await {
+            match timeout(self.batch_timeout, self.receiver.recv()).await {
                 Ok(Some(update)) => {
                     batch.push(update);
-                    if batch.len() >= BATCH_SIZE {
+                    if batch.len() >= self.batch_size {
                         self.process_batch(std::mem::take(&mut batch)).await;
                     }
                 }
@@ -70,7 +78,7 @@ impl Worker {
 
     async fn process_batch(&self, batch: Vec<AccountUpdate>) {
         let mut retries = 0;
-        while retries < MAX_RETRIES {
+        while retries < self.max_retries {
             match self.insert_batch(&batch).await {
                 Ok(_) => {
                     info!("Successfully inserted batch of {} records", batch.len());
@@ -80,9 +88,9 @@ impl Worker {
                     retries += 1;
                     error!(
                         "Batch insert failed (attempt {}/{}): {}",
-                        retries, MAX_RETRIES, e
+                        retries, self.max_retries, e
                     );
-                    if retries < MAX_RETRIES {
+                    if retries < self.max_retries {
                         sleep(Duration::from_secs(1 << retries)).await;
                     }
                 }
@@ -90,34 +98,30 @@ impl Worker {
         }
     }
 
-    async fn insert_batch(&self, batch: &[AccountUpdate]) -> Result<(), Box<dyn std::error::Error>> {
-        let values: Vec<String> = batch
+    async fn insert_batch(&self, batch: &[AccountUpdate]) -> Result<(), WorkerError> {
+        let rows: Vec<AccountRow> = batch
             .iter()
-            .map(|update| {
-                format!(
-                    "({}, '{}', '{}', {}, {}, {}, '{}', '{}', {}, {})",
-                    update.slot,
-                    update.pubkey,
-                    update.owner,
-                    update.lamports,
-                    update.executable,
-                    update.rent_epoch,
-                    update.data,
-                    update.updated_at.format("%Y-%m-%d %H:%M:%S%.3f"),
-                    update.txn_signature
-                        .as_ref()
-                        .map_or("NULL".to_string(), |s| format!("'{}'", s)),
-                    update.write_version
-                )
+            .map(|update| AccountRow {
+                slot: update.slot,
+                pubkey: update.pubkey.clone(),
+                owner: update.owner.clone(),
+                lamports: update.lamports,
+                executable: update.executable,
+                rent_epoch: update.rent_epoch,
+                data: update.data.clone(),
+                updated_at_unix_ms: update.updated_at_unix_ms,
+                txn_signature: update.txn_signature.clone(),
+                write_version: update.write_version,
             })
             .collect();
 
-        let query = format!(
-            "INSERT INTO accounts (slot, pubkey, owner, lamports, executable, rent_epoch, data, updated_at, txn_signature, write_version) VALUES {}",
-            values.join(",")
-        );
-
-        self.conn.client.query(&query).execute().await?;
+        self.conn.insert_accounts(&rows).await?;
         Ok(())
     }
+}
+
+#[derive(Debug, Error)]
+pub enum WorkerError {
+    #[error("clickhouse error: {0}")]
+    Clickhouse(#[from] crate::clickhouse_client::ClickhouseError),
 }

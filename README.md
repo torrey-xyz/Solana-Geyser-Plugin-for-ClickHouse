@@ -1,55 +1,102 @@
-> ⚠️ **Project Moved**  
-> This project has been moved to a new home: [https://github.com/torrey-xyz/Solana-Geyser-Plugin-for-ClickHouse](https://github.com/torrey-xyz/Solana-Geyser-Plugin-for-ClickHouse).  
-> All future development and maintenance will be handled by **Torrey**.
-
 # Solana Geyser Plugin for ClickHouse
-### Prerequisites
-- Rust toolchain (latest stable version)
-- Docker (for running ClickHouse locally)
-- Git
-- CMake (for building Solana)
 
-## Set Up Local Solana Development Environment
-- Install Solana CLI
-```
-sh -c "$(curl -sSfL https://release.solana.com/v1.17.0/install)"
+Simple production-ready setup for streaming account updates from a Solana validator into ClickHouse.
+
+## What This Plugin Does
+
+- Receives account update notifications from Geyser.
+- Buffers updates through an in-memory channel.
+- Writes updates in batches to ClickHouse with retry/backoff.
+- Automatically creates database and table schema (optional).
+
+## Prerequisites
+
+- Rust stable toolchain
+- Solana validator / `solana-test-validator`
+- Docker + Docker Compose
+
+## 1) Start ClickHouse
+
+```bash
+docker compose up -d
 ```
 
-## Configure Local Testnet
+ClickHouse will be available at:
+- HTTP: `http://127.0.0.1:8123`
+- Native: `127.0.0.1:9000`
+
+## 2) Build Plugin
+
+```bash
+cargo build --release
 ```
+
+Plugin artifact will be one of:
+- macOS: `target/release/libsolana_geyser_clickhouse.dylib`
+- Linux: `target/release/libsolana_geyser_clickhouse.so`
+
+## 3) Configure Geyser
+
+Update `config.json`:
+
+- Set `libpath` to the absolute path of your built plugin artifact.
+- Keep `clickhouse_url` as `http://127.0.0.1:8123` unless running remotely.
+
+Example:
+
+```json
+{
+  "libpath": "/absolute/path/to/libsolana_geyser_clickhouse.so",
+  "clickhouse_url": "http://127.0.0.1:8123",
+  "clickhouse_database": "solana",
+  "clickhouse_table": "accounts",
+  "batch_size": 1000,
+  "batch_timeout_ms": 5000,
+  "max_retries": 3,
+  "channel_capacity": 100000,
+  "create_schema": true
+}
+```
+
+## 4) Run Validator with Plugin
+
+```bash
 solana-test-validator --geyser-plugin-config ./config.json
 ```
 
-## Set Up ClickHouse
-Start ClickHouse using Docker
-```
-docker run -d --name clickhouse-server \
-    -p 8123:8123 \
-    -p 9000:9000 \
-    --ulimit nofile=262144:262144 \
-    clickhouse/clickhouse-server
+## 5) Verify Data Flow
+
+Trigger account activity (transfer, airdrop, etc.), then query ClickHouse:
+
+```bash
+docker exec -it solana-clickhouse clickhouse-client --query "
+SELECT slot, pubkey, lamports, write_version
+FROM solana.accounts
+ORDER BY slot DESC
+LIMIT 10"
 ```
 
-## Build and Test
-Build the Plugin
-```
-cargo build --release
-```
-Start Solana Validator with Plugin
-```
-solana-test-validator \
-    --geyser-plugin-config config.json
-```
-Test Data Flow
+## Table Schema
 
-Send test transactions:
+The plugin creates this table automatically when `create_schema=true`:
 
-```
-solana transfer <RECIPIENT_ADDRESS> 1 --url http://localhost:8899
-````
+- `slot UInt64`
+- `pubkey String`
+- `owner String`
+- `lamports UInt64`
+- `executable UInt8`
+- `rent_epoch UInt64`
+- `data String` (hex-encoded account data)
+- `updated_at_unix_ms Int64`
+- `txn_signature Nullable(String)`
+- `write_version UInt64`
 
-Query ClickHouse to verify data:
+Engine:
+- `ReplacingMergeTree(write_version)`
+- `ORDER BY (pubkey, slot)`
 
-```
-SELECT * FROM solana.transactions ORDER BY slot DESC LIMIT 5;
-```
+## Operational Notes
+
+- Keep `channel_capacity` high enough for your account update throughput.
+- Tune `batch_size` and `batch_timeout_ms` for your latency/throughput target.
+- On unload, the plugin drains remaining channel messages before worker exit.

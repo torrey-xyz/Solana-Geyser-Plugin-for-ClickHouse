@@ -1,9 +1,11 @@
 {
-    "libpath": "/path/to/libsolana_geyser_clickhouse.so",
-    "clickhouse": {
-      "endpoint": "tcp://localhost:9000",
-      "database": "solana",
-      "username": "default",
-      "password": ""
-    }
-  }
+  "libpath": "/absolute/path/to/libsolana_geyser_clickhouse.dylib",
+  "clickhouse_url": "http://127.0.0.1:8123",
+  "clickhouse_database": "solana",
+  "clickhouse_table": "accounts",
+  "batch_size": 1000,
+  "batch_timeout_ms": 5000,
+  "max_retries": 3,
+  "channel_capacity": 100000,
+  "create_schema": true
+}

@@ -1,41 +1,38 @@
-use std::{sync::Arc, thread};
+use std::{
+    sync::Arc,
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 use tokio::sync::mpsc::{self, Sender};
-use solana_geyser_plugin_interface::geyser_plugin_interface::{
+use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, Result,
 };
 use solana_sdk::clock::Slot;
-use log::{error, info, LevelFilter, Log};
-use thiserror::Error;
+use log::{info, LevelFilter, Log};
 use chrono::Utc;
 
 use crate::{
+    config::PluginConfig,
     clickhouse_client::ClickhouseConnection,
     worker::{AccountUpdate, Worker},
 };
 
-const CHANNEL_CAPACITY: usize = 100_000;
-
-#[derive(Error, Debug)]
-enum PluginError{
-    #[error("Replica account V0.0.1 not supported anymore")]
-    ReplicaAccountV001NotSupported,
-
-    #[error("Channel send error: {0}")]
-    ChannelError(#[from] mpsc::error::TrySendError<AccountUpdate>),
-}
-
 #[derive(Debug)]
 struct ClickhousePlugin {
-    conn: Arc<ClickhouseConnection>,
+    conn: Option<Arc<ClickhouseConnection>>,
+    config: PluginConfig,
     sender: Option<Sender<AccountUpdate>>,
+    worker_handle: Option<JoinHandle<()>>,
 }
 
 
 impl Default for ClickhousePlugin {
     fn default() -> Self {
         Self {
-            conn: Arc::new(ClickhouseConnection::new()),
-            sender: None
+            conn: None,
+            config: PluginConfig::default(),
+            sender: None,
+            worker_handle: None,
         }
     }
 }
@@ -57,36 +54,72 @@ impl GeyserPlugin for ClickhousePlugin {
 
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
         info!("ClickhousePlugin loaded with config file: {}", config_file);
-        let conn = Arc::new(ClickhouseConnection::new());
-        self.conn = conn.clone();
+        if self.sender.is_some() || self.worker_handle.is_some() {
+            self.on_unload();
+        }
 
-        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let config = PluginConfig::load(config_file)
+            .map_err(|e| GeyserPluginError::ConfigFileReadError { msg: e.to_string() })?;
+
+        let conn = Arc::new(ClickhouseConnection::new(
+            &config.clickhouse_url,
+            &config.clickhouse_database,
+            &config.clickhouse_table,
+        ));
+
+        if config.create_schema {
+            let rt =
+                tokio::runtime::Runtime::new().map_err(|e| GeyserPluginError::Custom(Box::new(e)))?;
+            rt.block_on(conn.ensure_schema())
+                .map_err(|e| custom_error(format!("failed to initialize schema: {e}")))?;
+        }
+
+        self.conn = Some(conn.clone());
+        self.config = config.clone();
+
+        let (sender, receiver) = mpsc::channel(config.channel_capacity);
         self.sender = Some(sender);
 
-        // Spawn worker thread to deligate
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new()
-                .expect("Failed to create Tokio runtime");
+        // Spawn worker thread to handle batched inserts.
+        let handle = thread::Builder::new()
+            .name("clickhouse-worker".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-            let mut worker = Worker::new(conn, receiver);
-            runtime.block_on(async move {
-                worker.run().await;
+                let mut worker = Worker::new(
+                    conn,
+                    receiver,
+                    config.batch_size,
+                    Duration::from_millis(config.batch_timeout_ms),
+                    config.max_retries,
+                );
+                runtime.block_on(async move {
+                    worker.run().await;
+                });
             });
-        });
+        self.worker_handle = Some(handle.map_err(|e| GeyserPluginError::Custom(Box::new(e)))?);
 
         Ok(())
     }
 
     fn on_unload(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
         info!("Clickhouse Plugin unloaded")
     }
 
     fn update_account(
         &self,
-        account: ReplicaAccountInfoVersions,
+        account: ReplicaAccountInfoVersions<'_>,
         slot: Slot,
         _is_startup: bool,
     ) -> Result<()> {
+        if self.conn.is_none() {
+            return Err(custom_error("plugin is not initialized"));
+        }
+
         if let ReplicaAccountInfoVersions::V0_0_3(account_info) = account {
             if let Some(sender) = &self.sender {
                 let update = AccountUpdate {
@@ -97,19 +130,17 @@ impl GeyserPlugin for ClickhousePlugin {
                     rent_epoch: account_info.rent_epoch,
                     data: hex::encode(account_info.data),
                     slot,
-                    updated_at: Utc::now(),
+                    updated_at_unix_ms: Utc::now().timestamp_millis(),
                     txn_signature: None,
                     write_version: account_info.write_version,
                 };
 
                 sender
                     .try_send(update)
-                    .map_err(|e| GeyserPluginError::Custom(Box::new(PluginError::ChannelError(e))))?;
+                    .map_err(|e| custom_error(format!("channel send error: {e}")))?;
             }
         } else {
-            return Err(GeyserPluginError::Custom(Box::new(
-                PluginError::ReplicaAccountV001NotSupported,
-            )));
+            return Err(custom_error("unsupported replica account version"));
         }
 
         Ok(())
@@ -144,4 +175,8 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
     let plugin = ClickhousePlugin::default();
     let plugin = Box::new(plugin);
     Box::into_raw(plugin)
+}
+
+fn custom_error(msg: impl Into<String>) -> GeyserPluginError {
+    GeyserPluginError::Custom(Box::new(std::io::Error::other(msg.into())))
 }
